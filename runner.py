@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""Build an AdGuard DNS rewrite filter from ordered Smart DNS hosts lists."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+RULE_SOURCES = [
+    ("GeoHide", "https://raw.githubusercontent.com/Noktomezo/RussiaFancyLists/main/lists/hosts/geohide.hosts"),
+    ("Malw", "https://raw.githubusercontent.com/Noktomezo/RussiaFancyLists/main/lists/hosts/malw.hosts"),
+    ("Bezmezhau", "https://raw.githubusercontent.com/Noktomezo/RussiaFancyLists/main/lists/hosts/bezmezhau.hosts"),
+    ("WL DNS", "https://raw.githubusercontent.com/Noktomezo/RussiaFancyLists/main/lists/hosts/wl-dns.hosts"),
+    ("Combined", "https://raw.githubusercontent.com/Noktomezo/RussiaFancyLists/main/lists/hosts/combined.hosts"),
+]
+BLOCK_IPS = {"0.0.0.0", "127.0.0.1", "::1"}
+USER_AGENT = "dns-rewrite-runner/1.0"
+
+
+@dataclass(frozen=True)
+class Rewrite:
+    domain: str
+    address: str
+    source: str
+
+
+def log(message: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}] {message}", flush=True)
+
+
+def parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def normalize_domain(value: str) -> str:
+    value = value.strip().rstrip(".").lower()
+    if value.startswith("www."):
+        value = value[4:]
+    if not value or len(value) > 253:
+        raise ValueError("empty or overlong domain")
+    try:
+        ascii_domain = value.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError("invalid internationalized domain") from exc
+    labels = ascii_domain.split(".")
+    if any(not label or len(label) > 63 or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label) for label in labels):
+        raise ValueError("invalid domain name")
+    return ascii_domain
+
+
+def excluded(domain: str, exclusions: set[str]) -> bool:
+    return any(domain == excluded_domain or domain.endswith("." + excluded_domain) for excluded_domain in exclusions)
+
+
+def fetch_source(url: str, timeout: int) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        charset = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(charset, errors="replace")
+
+
+def parse_hosts(text: str, source: str, exclusions: set[str]) -> list[Rewrite]:
+    result: list[Rewrite] = []
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        columns = line.split()
+        if len(columns) < 2:
+            continue
+        try:
+            address = ipaddress.ip_address(columns[0])
+        except ValueError:
+            continue
+        if str(address) in BLOCK_IPS:
+            continue
+        for raw_domain in columns[1:]:
+            try:
+                domain = normalize_domain(raw_domain)
+            except ValueError:
+                log(f"WARN {source}:{line_number}: skipped invalid domain {raw_domain!r}")
+                continue
+            if excluded(domain, exclusions):
+                continue
+            result.append(Rewrite(domain, str(address), source))
+    return result
+
+
+def load_rule_sources(timeout: int, exclusions: set[str]) -> tuple[list[Rewrite], list[str]]:
+    """Merge lists in priority order; first source containing a domain wins."""
+    first_by_domain: dict[str, Rewrite] = {}
+    successful_sources: list[str] = []
+    failures: list[str] = []
+    for name, url in RULE_SOURCES:
+        log(f"Loading rules source {name}: {url}")
+        try:
+            content = fetch_source(url, timeout)
+            rewrites = parse_hosts(content, name, exclusions)
+            for rewrite in rewrites:
+                first_by_domain.setdefault(rewrite.domain, rewrite)
+            successful_sources.append(name)
+            log(f"Loaded {len(rewrites)} rewrite rows from {name}; total unique domains: {len(first_by_domain)}")
+        except (urllib.error.URLError, TimeoutError, UnicodeError, ValueError) as exc:
+            failures.append(f"{name}: {exc}")
+            log(f"WARN source {name} unavailable: {exc}; continuing with next source")
+    if not first_by_domain:
+        raise RuntimeError("no rewrite rules loaded from any source: " + "; ".join(failures))
+    return list(first_by_domain.values()), successful_sources
+
+
+def render(rewrites: list[Rewrite], title: str, homepage: str) -> str:
+    lines = [
+        "! Title: " + title,
+        "! Description: Smart DNS redirect rules for AdGuard.",
+        "! Homepage: " + homepage,
+        "! Expires: 1 days",
+        "! This file is generated by runner.py. Do not edit it manually.",
+        "",
+    ]
+    lines.extend(f"||{item.domain}^$dnsrewrite=NOERROR;{ 'AAAA' if ':' in item.address else 'A' };{item.address}".replace("; ", ";") for item in rewrites)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", "public/adguard-dns-rewrites.txt"))
+    parser.add_argument("--check", action="store_true", help="validate configuration and print counts without writing output")
+    args = parser.parse_args()
+
+    exclusions = set()
+    for item in parse_csv(os.getenv("EXCLUDE_REDIRECT", "")):
+        try:
+            exclusions.add(normalize_domain(item))
+        except ValueError as exc:
+            log(f"ERROR: invalid EXCLUDE_REDIRECT domain {item!r}: {exc}")
+            return 2
+    try:
+        timeout = int(os.getenv("HTTP_TIMEOUT", "30"))
+        if timeout < 1:
+            raise ValueError
+    except ValueError:
+        log("ERROR: HTTP_TIMEOUT must be a positive integer")
+        return 2
+
+    first_by_domain: dict[str, Rewrite] = {}
+    try:
+        rewrites, successful_sources = load_rule_sources(timeout, exclusions)
+        if not rewrites:
+            raise RuntimeError("no rewrite rules were produced; refusing to publish an empty filter")
+        log(f"Total unique rewrite domains: {len(rewrites)}; sources loaded: {', '.join(successful_sources)}")
+        if args.check:
+            return 0
+
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        title = os.getenv("FILTER_TITLE", "Smart DNS Rewrites for AdGuard")
+        homepage = os.getenv("FILTER_HOMEPAGE", "https://example.github.io/")
+        output.write_text(render(rewrites, title, homepage), encoding="utf-8", newline="\n")
+        log(f"Wrote filter to {output} ({output.stat().st_size} bytes)")
+        return 0
+    except Exception as exc:
+        log(f"ERROR: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,45 @@
+name: Build AdGuard DNS rewrite filter
+
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+
+concurrency:
+  group: build-adguard-filter
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Build filter
+        env:
+          EXCLUDE_REDIRECT: ${{ vars.EXCLUDE_REDIRECT }}
+          HTTP_TIMEOUT: "30"
+          FILTER_TITLE: GeoHide DNS Rewrites for AdGuard
+          FILTER_HOMEPAGE: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+        run: python runner.py
+
+      - name: Commit updated filter
+        if: github.event_name != 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add public/adguard-dns-rewrites.txt
+          if git diff --cached --quiet; then
+            echo "Filter has no changes."
+          else
+            git commit -m "Update generated AdGuard DNS filter"
+            git push
+          fi
