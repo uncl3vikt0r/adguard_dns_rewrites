@@ -136,7 +136,7 @@ def render(rewrites: list[Rewrite], title: str, homepage: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", "public/adguard-dns-rewrites.txt"))
+    parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", "docs/adguard-dns-rewrites.txt"))
     parser.add_argument("--check", action="store_true", help="validate configuration and print counts without writing output")
     args = parser.parse_args()
 
